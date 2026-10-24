@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Night Cam</title>
+<style>
+  :root { --bg:#0f1115; --card:#191c23; --text:#e8eaf0; --muted:#8a90a0; --accent:#4f8cff; --red:#ff4d4d; --green:#3ecf7a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 -apple-system,system-ui,sans-serif; }
+  #app { max-width:520px; margin:0 auto; padding:16px; }
+  h1 { font-size:22px; margin:4px 0 12px; }
+  video { width:100%; border-radius:12px; background:#000; aspect-ratio:4/3; object-fit:cover; }
+  .card { background:var(--card); border-radius:12px; padding:12px; margin:12px 0; }
+  .row { display:flex; justify-content:space-between; gap:8px; margin:4px 0; }
+  .muted { color:var(--muted); }
+  .rec { color:var(--red); font-weight:600; }
+  .ok { color:var(--green); }
+  .bar { height:8px; background:#2a2f3a; border-radius:4px; overflow:hidden; margin-top:6px; position:relative; }
+  .bar > i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .bar > b { position:absolute; top:-2px; bottom:-2px; width:2px; background:var(--red); }
+  button { font:inherit; border:0; border-radius:10px; padding:12px; background:var(--accent); color:#fff; width:100%; margin:4px 0; }
+  button.secondary { background:#2a2f3a; }
+  .btns { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  label { display:block; margin:10px 0 4px; color:var(--muted); font-size:14px; }
+  input { font:inherit; width:100%; padding:10px; border-radius:8px; border:1px solid #2a2f3a; background:#0f1115; color:var(--text); }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  details summary { cursor:pointer; font-weight:600; }
+  #log { font:12px/1.4 ui-monospace,Menlo,monospace; color:var(--muted); max-height:160px; overflow:auto; white-space:pre-wrap; }
+  #black { position:fixed; inset:0; background:#000; display:none; z-index:10; color:#222; font-size:13px; align-items:flex-end; justify-content:center; padding-bottom:30px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <h1>Night Cam</h1>
+  <video id="v" playsinline muted autoplay></video>
+
+  <div class="card">
+    <div class="row"><span>Status</span><span id="mode" class="muted">Camera off</span></div>
+    <div class="row"><span>Saved on phone</span><span id="pending">0 clips</span></div>
+    <div class="row"><span>Internet</span><span id="net">–</span></div>
+    <div class="row"><span>Last sent</span><span id="last" class="muted">–</span></div>
+    <div class="row" style="margin-top:8px"><span>Motion</span><span id="pct" class="muted">0%</span></div>
+    <div class="bar"><i id="meter"></i><b id="thr"></b></div>
+  </div>
+
+  <button id="startBtn">Start camera</button>
+  <div class="btns">
+    <button class="secondary" id="blackBtn">Black screen</button>
+    <button class="secondary" id="sendBtn">Send now</button>
+    <button class="secondary" id="testBtn">Test email</button>
+    <button class="secondary" id="testRecBtn">Test recording</button>
+  </div>
+
+  <div class="card">
+    <details id="settingsBox">
+      <summary>Settings</summary>
+      <label>Google script URL</label>
+      <input id="url" placeholder="https://script.google.com/macros/s/.../exec" autocomplete="off" autocapitalize="off">
+      <label>Password (same as SECRET in the script)</label>
+      <input id="secret" autocomplete="off" autocapitalize="off">
+      <div class="two">
+        <div><label>Start watching</label><input id="start" type="time"></div>
+        <div><label>Stop watching</label><input id="end" type="time"></div>
+      </div>
+      <div class="two">
+        <div><label>Motion trigger (% of picture)</label><input id="sens" type="number" min="0.5" max="50" step="0.5"></div>
+        <div><label>Longest clip (seconds)</label><input id="maxClip" type="number" min="10" max="300" step="5"></div>
+      </div>
+      <label>Keep recording after motion stops (seconds)</label>
+      <input id="cooldown" type="number" min="2" max="60" step="1">
+      <button id="saveBtn" style="margin-top:12px">Save settings</button>
+    </details>
+  </div>
+
+  <div class="card"><div id="log"></div></div>
+</div>
+<div id="black">tap to show</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('v');
+
+  // ---------- settings & small state (localStorage) ----------
+  const DEF = { url:'', secret:'', start:'21:00', end:'08:00', sens:3, maxClip:60, cooldown:5 };
+  const readLS = (k, d) => { try { return Object.assign({}, d, JSON.parse(localStorage.getItem(k) || '{}')); } catch (e) { return Object.assign({}, d); } };
+  const writeLS = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+  let cfg = readLS('nc_cfg', DEF);
+  let state = readLS('nc_state', { armed:[], notified:[], lastSent:'' });
+  const saveState = () => writeLS('nc_state', state);
+
+  const fields = ['url','secret','start','end','sens','maxClip','cooldown'];
+  fields.forEach(f => $(f).value = cfg[f]);
+  if (!cfg.url || !cfg.secret) $('settingsBox').open = true;
+  $('saveBtn').onclick = () => {
+    fields.forEach(f => { const el = $(f); cfg[f] = el.type === 'number' ? Number(el.value) : el.value.trim(); });
+    writeLS('nc_cfg', cfg); log('Settings saved'); $('settingsBox').open = false; updateStatus();
+  };
+
+  // ---------- log ----------
+  function log(msg) {
+    const t = new Date().toLocaleTimeString([], { hour:'numeric', minute:'2-digit' });
+    const el = $('log'); el.textContent = `${t}  ${msg}\n` + el.textContent.slice(0, 4000);
+  }
+
+  // ---------- time window ----------
+  const toMin = t => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
+  const pad = n => String(n).padStart(2, '0');
+  const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const hms = d => `${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+  function inWindow(d) {
+    const s = toMin(cfg.start), e = toMin(cfg.end), m = d.getHours() * 60 + d.getMinutes();
+    return s > e ? (m >= s || m < e) : (m >= s && m < e);
+  }
+  function nightKey(d) {
+    const s = toMin(cfg.start), e = toMin(cfg.end), m = d.getHours() * 60 + d.getMinutes();
+    const x = new Date(d);
+    if (s > e && m < e) x.setDate(x.getDate() - 1); // after midnight belongs to the previous evening
+    return ymd(x);
+  }
+  function windowEnded(night, now) {
+    const [y, mo, da] = night.split('-').map(Number);
+    const s = toMin(cfg.start), e = toMin(cfg.end);
+    const end = new Date(y, mo - 1, da, Math.floor(e / 60), e % 60);
+    if (s > e) end.setDate(end.getDate() + 1);
+    return now >= end;
+  }
+  const fmt12 = t => { const m = toMin(t), h = Math.floor(m / 60); return `${(h % 12) || 12}:${pad(m % 60)} ${h < 12 ? 'AM' : 'PM'}`; };
+
+  // ---------- IndexedDB clip storage ----------
+  let db;
+  const openDB = () => new Promise((res, rej) => {
+    const r = indexedDB.open('nightcam', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('clips', { keyPath:'name' });
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  const tx = (mode, fn) => new Promise((res, rej) => {
+    const t = db.transaction('clips', mode); const req = fn(t.objectStore('clips')); let out;
+    if (req) req.onsuccess = () => { out = req.result; };
+    t.oncomplete = () => res(out); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error);
+  });
+  const putClip = c => tx('readwrite', s => s.put(c));
+  const delClip = n => tx('readwrite', s => s.delete(n));
+  const getClip = n => tx('readonly', s => s.get(n));
+  const clipNames = async () => ((await tx('readonly', s => s.getAllKeys())) || []).sort();
+
+  // ---------- camera ----------
+  let stream = null, wakeLock = null;
+  async function startCam() {
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode:'environment', width:{ ideal:640 }, height:{ ideal:480 }, frameRate:{ ideal:15 } },
+        audio: false
+      });
+      video.srcObject = stream; await video.play();
+      $('startBtn').textContent = 'Camera running'; $('startBtn').disabled = true;
+      log('Camera started'); requestWake();
+    } catch (e) { log('Camera error: ' + e.message); alert('Could not start the camera: ' + e.message); }
+  }
+  async function requestWake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && stream) requestWake(); });
+  $('startBtn').onclick = startCam;
+
+  // ---------- motion detection ----------
+  const CW = 48, CH = 36, cv = document.createElement('canvas'); cv.width = CW; cv.height = CH;
+  const cx = cv.getContext('2d', { willReadFrequently:true });
+  let prev = null;
+  function motionPct() {
+    cx.drawImage(video, 0, 0, CW, CH);
+    const d = cx.getImageData(0, 0, CW, CH).data, g = new Float32Array(CW * CH);
+    let mean = 0;
+    for (let i = 0, j = 0; i < d.length; i += 4, j++) { g[j] = d[i] * .299 + d[i + 1] * .587 + d[i + 2] * .114; mean += g[j]; }
+    mean /= g.length;
+    for (let j = 0; j < g.length; j++) g[j] -= mean; // ignore whole-picture brightness shifts
+    let changed = 0;
+    if (prev) for (let j = 0; j < g.length; j++) if (Math.abs(g[j] - prev[j]) > 25) changed++;
+    const had = !!prev; prev = g;
+    return had ? changed / g.length * 100 : 0;
+  }
+
+  // ---------- recording ----------
+  let rec = null, recording = false, recStart = 0, lastMotion = 0, hits = 0;
+  function pickMime() {
+    if (!window.MediaRecorder) return null;
+    for (const m of ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp8', 'video/webm'])
+      if (MediaRecorder.isTypeSupported(m)) return m;
+    return '';
+  }
+  function makeRecorder(onDone) {
+    const mime = pickMime();
+    if (mime === null) { log('This iPhone is too old to record video in Safari (needs iOS 14.3+)'); return null; }
+    const opts = { videoBitsPerSecond: 600000 }; if (mime) opts.mimeType = mime;
+    let r; try { r = new MediaRecorder(stream, opts); } catch (e) { log('Recorder error: ' + e.message); return null; }
+    const chunks = [];
+    r.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+    r.onstop = () => { const type = r.mimeType || mime || 'video/mp4'; onDone(new Blob(chunks, { type })); };
+    r.start(1000);
+    return r;
+  }
+  function startRec() {
+    const started = new Date();
+    rec = makeRecorder(async blob => {
+      const ext = blob.type.includes('mp4') ? 'mp4' : 'webm';
+      const night = nightKey(started), name = `${night}__${hms(started)}.${ext}`;
+      try {
+        await putClip({ name, mime: blob.type.split(';')[0], buf: await blob.arrayBuffer(), size: blob.size });
+        if (!state.armed.includes(night)) { state.armed.push(night); saveState(); }
+        log(`Saved clip ${hms(started).replace(/-/g, ':')} (${(blob.size / 1e6).toFixed(1)} MB)`);
+      } catch (e) { log('Could not save clip (phone full?): ' + e.message); }
+      updateStatus();
+    });
+    if (!rec) return;
+    recording = true; recStart = Date.now(); updateStatus();
+  }
+  function stopRec() { if (rec && rec.state !== 'inactive') rec.stop(); rec = null; recording = false; updateStatus(); }
+
+  $('testRecBtn').onclick = () => {
+    if (!stream) return alert('Start the camera first.');
+    if (recording) return alert('Already recording.');
+    const r = makeRecorder(blob => log(`Test recording worked: 3 sec = ${(blob.size / 1e3).toFixed(0)} KB (${blob.type || 'unknown type'})`));
+    if (r) { log('Recording 3-second test…'); setTimeout(() => r.state !== 'inactive' && r.stop(), 3000); }
+  };
+
+  // ---------- main loop ----------
+  setInterval(() => {
+    if (!stream || video.readyState < 2) return;
+    const pct = motionPct();
+    $('meter').style.width = Math.min(100, pct * 4) + '%';
+    $('pct').textContent = pct.toFixed(1) + '%';
+    const now = new Date(), armed = inWindow(now);
+    if (armed) {
+      const night = nightKey(now);
+      if (!state.armed.includes(night)) { state.armed.push(night); saveState(); }
+    }
+    if (!armed) { hits = 0; if (recording) stopRec(); return; }
+    hits = pct >= cfg.sens ? hits + 1 : 0;
+    const t = Date.now();
+    if (hits >= 2) { lastMotion = t; if (!recording) startRec(); }
+    if (recording && (t - lastMotion > cfg.cooldown * 1000 || t - recStart > cfg.maxClip * 1000)) stopRec();
+  }, 250);
+
+  // ---------- uploading ----------
+  function b64(buf) {
+    const u = new Uint8Array(buf); let s = '';
+    for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+  async function post(obj) {
+    const res = await fetch(cfg.url, {
+      method:'POST', headers:{ 'Content-Type':'text/plain;charset=utf-8' },
+      body: JSON.stringify(Object.assign({}, obj, { secret: cfg.secret }))
+    });
+    return res.json();
+  }
+  let uploading = false;
+  async function uploadPending(manual) {
+    if (uploading || recording) return;
+    if (!cfg.url || !cfg.secret) { if (manual) alert('Add the script URL and password in Settings first.'); return; }
+    if (!navigator.onLine) { if (manual) log('No internet right now'); return; }
+    uploading = true; updateStatus();
+    try {
+      for (const n of await clipNames()) {
+        if (recording) break;
+        const c = await getClip(n); if (!c) continue;
+        const r = await post({ action:'upload', night: n.split('__')[0], name: n, mime: c.mime, data: b64(c.buf) });
+        if (!r.ok) { log('Upload refused: ' + r.error); break; }
+        await delClip(n); // only deleted after Google confirms it saved
+        state.lastSent = new Date().toLocaleString(); saveState();
+        log('Sent and removed ' + n);
+        updateStatus();
+      }
+      await finishNights();
+    } catch (e) { log('Could not reach Google (' + e.message + '). Will retry.'); }
+    finally { uploading = false; updateStatus(); }
+  }
+  async function finishNights() {
+    const pendingNights = new Set((await clipNames()).map(n => n.split('__')[0]));
+    const now = new Date();
+    for (const night of state.armed.slice()) {
+      if (state.notified.includes(night)) { state.armed = state.armed.filter(x => x !== night); saveState(); continue; }
+      if (!windowEnded(night, now) || pendingNights.has(night)) continue;
+      const r = await post({ action:'finish', night });
+      if (r.ok) {
+        state.notified = state.notified.concat(night).slice(-40);
+        state.armed = state.armed.filter(x => x !== night); saveState();
+        log('Emailed summary for night of ' + night);
+      } else { log('Email step failed: ' + r.error); }
+    }
+  }
+  $('sendBtn').onclick = () => uploadPending(true);
+  $('testBtn').onclick = async () => {
+    if (!cfg.url || !cfg.secret) return alert('Add the script URL and password in Settings first.');
+    try { const r = await post({ action:'test' }); log(r.ok ? 'Test email sent — check your inbox' : 'Test failed: ' + r.error); }
+    catch (e) { log('Test failed: ' + e.message); }
+  };
+  window.addEventListener('online', () => { log('Back online'); uploadPending(); updateStatus(); });
+  window.addEventListener('offline', updateStatus);
+  setInterval(uploadPending, 60 * 1000);
+
+  // ---------- status ----------
+  async function updateStatus() {
+    const m = $('mode');
+    if (!stream) { m.textContent = 'Camera off'; m.className = 'muted'; }
+    else if (recording) { m.textContent = '● Recording'; m.className = 'rec'; }
+    else if (inWindow(new Date())) { m.textContent = `Watching until ${fmt12(cfg.end)}`; m.className = 'ok'; }
+    else { m.textContent = `Idle until ${fmt12(cfg.start)}`; m.className = 'muted'; }
+    $('net').textContent = uploading ? 'Sending…' : (navigator.onLine ? 'Online' : 'Offline');
+    $('thr').style.left = Math.min(100, cfg.sens * 4) + '%';
+    $('last').textContent = state.lastSent || '–';
+    if (db) { try { const n = (await clipNames()).length; $('pending').textContent = n + (n === 1 ? ' clip' : ' clips'); } catch (e) {} }
+  }
+  setInterval(updateStatus, 15000);
+
+  // ---------- black screen ----------
+  $('blackBtn').onclick = () => { $('black').style.display = 'flex'; };
+  $('black').onclick = () => { $('black').style.display = 'none'; };
+
+  // ---------- boot ----------
+  openDB().then(d => { db = d; updateStatus(); uploadPending(); })
+          .catch(e => log('Storage error: ' + e.message));
+  if (!navigator.mediaDevices) log('Open this page over https in Safari so the camera works.');
+  updateStatus();
+})();
+</script>
+</body>
+</html>
